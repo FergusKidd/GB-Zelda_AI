@@ -77,13 +77,14 @@ class AzureOpenAIClient:
             logger.error(f"Failed to encode image: {e}")
             return ""
     
-    def get_game_decision(self, screen_image: np.ndarray, game_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def get_game_decision(self, screen_image: np.ndarray, game_state: Dict[str, Any], history_context: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
         """
         Send screen capture to Azure OpenAI and get game decision.
         
         Args:
             screen_image: Current screen as numpy array
             game_state: Current game state information
+            history_context: History context for better decision making
             
         Returns:
             Dictionary containing AI decision or None if failed
@@ -96,7 +97,7 @@ class AzureOpenAIClient:
                 return None
             
             # Prepare the prompt
-            prompt = self._create_game_prompt(game_state)
+            prompt = self._create_game_prompt(game_state, history_context)
             
             # Create the message
             messages = [
@@ -129,14 +130,14 @@ class AzureOpenAIClient:
             decision_text = response.choices[0].message.content
             decision = self._parse_decision(decision_text)
             
-            logger.info(f"Received AI decision: {decision}")
+            logger.debug(f"Received AI decision: {decision}")
             return decision
             
         except Exception as e:
             logger.error(f"Failed to get game decision from Azure OpenAI: {e}")
             return None
     
-    def _create_game_prompt(self, game_state: Dict[str, Any]) -> str:
+    def _create_game_prompt(self, game_state: Dict[str, Any], history_context: Dict[str, Any] = None) -> str:
         """
         Create the prompt for the AI based on current game state.
         
@@ -147,58 +148,81 @@ class AzureOpenAIClient:
             Formatted prompt string
         """
         prompt = f"""
-You are playing The Legend of Zelda on Game Boy. Analyze the current screen and create a sequence of button presses to achieve your goals.
+You are playing The Legend of Zelda on Game Boy. Look at the current screen and decide what Link should do next.
 
-Current Game State:
-- Health: {game_state.get('health', 'Unknown')}
-- Rupees: {game_state.get('rupees', 'Unknown')}
-- Current Screen: {game_state.get('current_screen', 'Unknown')}
-- Position: ({game_state.get('position_x', 'Unknown')}, {game_state.get('position_y', 'Unknown')})
+Current Situation:
 - In Text Box: {game_state.get('in_text_box', False)}
-- In Menu: {game_state.get('in_menu', False)}
+- Text Detected: "{game_state.get('text_detected', '')}"
 
-IMPORTANT: If "In Text Box" is True, you MUST press 'a' to advance the dialogue. Do NOT try to move or do other actions.
-
-Available Game Boy Buttons:
-- up, down, left, right: Move Link
-- a: Sword attack, interact with objects/NPCs
-- b: Use equipped item, cancel
-- start: Open pause menu
-- select: Open item menu
-
-Create a sequence of button presses (2-5 actions) to accomplish your immediate goals. Each action should specify:
-- button: The button to press
-- duration: How long to hold it (in frames, 60fps = 1 second)
-- delay: Wait time after releasing (in frames)
-
-Analyze the screen carefully and respond with a JSON object containing:
-1. "sequence": Array of button actions [{{"button": "right", "duration": 30, "delay": 10}}, ...]
-2. "reasoning": Brief explanation of the strategy
-3. "confidence": Confidence level from 0.0 to 1.0
-4. "goals": List of 2-3 immediate goals you're trying to achieve
-
-Focus on:
-- Avoiding enemies and obstacles
-- Collecting items and rupees
-- Progressing through the game
-- Maintaining health
-- Exploring new areas
-- ADVANCING DIALOGUE when in text boxes
+{self._format_history_context(history_context)}
 
 CRITICAL RULES:
 1. If "In Text Box" is True: ONLY press 'a' to advance dialogue
-2. If "In Menu" is True: Use appropriate menu navigation
-3. Never try to move when in dialogue or menus
+2. If you see text/dialogue: Press 'a' to continue
+3. Otherwise: Move Link to explore and find items/NPCs
+4. You must be facing an NPC directly before pressing 'a' to interact with them
+5. Do not repeatedly talk to the same NPC over and over
 
-Example sequences:
-- Move right and attack: [{{"button": "right", "duration": 30, "delay": 5}}, {{"button": "a", "duration": 10, "delay": 0}}]
-- Explore area: [{{"button": "up", "duration": 20, "delay": 5}}, {{"button": "right", "duration": 25, "delay": 5}}]
+Available Actions:
+- up, down, left, right: Move Link
+- a: Interact, attack, advance dialogue
+- b: Use item, cancel
 
-Note: Use shorter durations (15-30 frames) for movement buttons for more responsive control.
+IMPORTANT: Look carefully at the screen image. If you see ANY text, dialogue, or words on screen, include them in the "screen_text" field.
 
-Respond ONLY with valid JSON, no other text.
+Create a simple sequence of 1-3 button presses. Use short durations (5-15 frames).
+
+Examples:
+- Advance dialogue: [{{"button": "a", "duration": 5, "delay": 0}}]
+- Move and interact: [{{"button": "right", "duration": 15, "delay": 2}}, {{"button": "a", "duration": 5, "delay": 0}}]
+
+Respond with JSON only:
+{{
+  "sequence": [{{"button": "a", "duration": 5, "delay": 0}}],
+  "reasoning": "Brief explanation",
+  "confidence": 0.9,
+  "goals": ["Goal 1", "Goal 2"],
+  "screen_text": "Any text you see on screen, or empty string if none"
+}}
 """
         return prompt
+    
+    def _format_history_context(self, history_context: Dict[str, Any]) -> str:
+        """
+        Format history context for the AI prompt (simplified to avoid confusion).
+        
+        Args:
+            history_context: History context from HistoryManager
+            
+        Returns:
+            Formatted history context string
+        """
+        if not history_context:
+            return ""
+        
+        context_parts = []
+        
+        # Only show the last 2 decisions to avoid overwhelming the AI
+        recent_decisions = history_context.get('recent_decisions', [])
+        if recent_decisions:
+            context_parts.append("Recent Actions:")
+            for decision in recent_decisions[-2:]:  # Only last 2 decisions
+                sequence_str = ", ".join([action['button'] for action in decision['sequence']])
+                success_str = "✅" if decision['success'] else "❌"
+                context_parts.append(f"  {success_str} {sequence_str}")
+        
+        # Only show recent story events if they're dialogue
+        recent_story = history_context.get('recent_story', [])
+        if recent_story:
+            dialogue_events = [event for event in recent_story[-3:] if event['type'] == 'dialogue']
+            if dialogue_events:
+                context_parts.append("\nRecent Dialogue:")
+                for event in dialogue_events:
+                    context_parts.append(f"  \"{event['content'][:50]}...\"")
+        
+        if context_parts:
+            return "\n".join(context_parts) + "\n"
+        return ""
     
     def _parse_decision(self, decision_text: str) -> Optional[Dict[str, Any]]:
         """
@@ -229,6 +253,10 @@ Respond ONLY with valid JSON, no other text.
                 if field not in decision:
                     logger.error(f"Missing required field in AI decision: {field}")
                     return None
+            
+            # Add default screen_text if not provided
+            if 'screen_text' not in decision:
+                decision['screen_text'] = ""
             
             # Validate sequence
             if not isinstance(decision['sequence'], list) or len(decision['sequence']) == 0:

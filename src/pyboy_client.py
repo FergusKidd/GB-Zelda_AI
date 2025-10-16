@@ -3,11 +3,12 @@ PyBoy integration for running Zelda ROM and capturing screen data.
 """
 import os
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any, List
 import numpy as np
 from PIL import Image
 from pyboy import PyBoy
 from pyboy.utils import WindowEvent
+from text_extractor import TextExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,8 @@ class PyBoyClient:
         self.rom_path = rom_path
         self.game_speed = game_speed
         self.window_type = window_type
+        self.is_executing_input = False  # Flag to prevent main loop interference
+        self.text_extractor = TextExtractor()  # For extracting text from screens
         self.pyboy: Optional[PyBoy] = None
         self.screen_width = 160
         self.screen_height = 144
@@ -119,9 +122,29 @@ class PyBoyClient:
             return False
             
         try:
-            logger.info(f"🔘 Sending button press: {button} (delay: {delay} frames)")
-            self.pyboy.send_input(button_map[button], delay=delay)
-            logger.info(f"✅ Button press sent successfully: {button}")
+            logger.debug(f"🔘 Sending button press: {button} (delay: {delay} frames)")
+            
+            # Send press input
+            self.pyboy.send_input(button_map[button])
+            
+            # Process the input for the specified duration
+            for _ in range(delay):
+                self.pyboy.tick()
+            
+            # Send release input
+            release_map = {
+                'up': WindowEvent.RELEASE_ARROW_UP,
+                'down': WindowEvent.RELEASE_ARROW_DOWN,
+                'left': WindowEvent.RELEASE_ARROW_LEFT,
+                'right': WindowEvent.RELEASE_ARROW_RIGHT,
+                'a': WindowEvent.RELEASE_BUTTON_A,
+                'b': WindowEvent.RELEASE_BUTTON_B,
+                'start': WindowEvent.RELEASE_BUTTON_START,
+                'select': WindowEvent.RELEASE_BUTTON_SELECT,
+            }
+            self.pyboy.send_input(release_map[button])
+            
+            logger.debug(f"✅ Button press completed: {button} for {delay} frames")
             return True
         except Exception as e:
             logger.error(f"Failed to press button {button}: {e}")
@@ -182,35 +205,52 @@ class PyBoyClient:
             return False
             
         try:
+            self.is_executing_input = True  # Prevent main loop interference
+            logger.debug(f"🎮 Executing: {len(sequence)} actions")
+            
             for i, action in enumerate(sequence):
                 button = action['button']
                 duration_frames = action['duration']
                 delay_frames = action.get('delay', 0)
                 
-                logger.info(f"🎮 Action {i+1}/{len(sequence)}: {button.upper()} for {duration_frames} frames")
+                # Cap durations for better responsiveness
+                if button in ['up', 'down', 'left', 'right']:
+                    # Movement buttons: cap at 15 frames (0.25 seconds)
+                    duration_frames = min(duration_frames, 15)
+                elif button == 'a':
+                    # A button: cap at 5 frames (0.08 seconds) for quick presses
+                    duration_frames = min(duration_frames, 5)
+                else:
+                    # Other buttons: cap at 10 frames (0.17 seconds)
+                    duration_frames = min(duration_frames, 10)
+                
+                logger.debug(f"🎮 Action {i+1}/{len(sequence)}: {button.upper()} for {duration_frames} frames (capped)")
                 
                 # Use PyBoy's delay parameter for precise timing
                 if not self.press_button(button, delay=duration_frames):
                     logger.error(f"Failed to execute action: {action}")
                     return False
                 
-                # Wait for delay between actions
+                # Wait for delay between actions (also cap delays)
                 if delay_frames > 0:
-                    logger.info(f"⏱️  Waiting {delay_frames} frames between actions")
+                    delay_frames = min(delay_frames, 5)  # Cap delay at 5 frames
+                    logger.debug(f"⏱️  Waiting {delay_frames} frames between actions")
                     for _ in range(delay_frames):
                         self.pyboy.tick()
             
             # Ensure all inputs are fully processed
-            logger.info("🔄 Processing final inputs...")
-            for _ in range(5):  # Extra ticks to ensure processing
+            logger.debug("🔄 Processing final inputs...")
+            for _ in range(3):  # Reduced from 5 to 3 ticks
                 self.pyboy.tick()
             
-            logger.info(f"✅ Sequence completed: {len(sequence)} actions")
+            logger.debug(f"✅ Completed: {len(sequence)} actions")
             return True
             
         except Exception as e:
             logger.error(f"Failed to execute sequence: {e}")
             return False
+        finally:
+            self.is_executing_input = False  # Re-enable main loop ticking
     
     def tick(self) -> bool:
         """
@@ -243,6 +283,12 @@ class PyBoyClient:
             # Detect if we're in a text box by checking screen patterns
             is_in_text_box = self._detect_text_box()
             
+            # Extract text from screen
+            screen_image = self.get_screen_image()
+            detected_text = ""
+            if screen_image is not None:
+                detected_text = self.text_extractor.extract_text_from_screen(screen_image) or ""
+            
             # This is a placeholder - you'll need to implement actual game state reading
             # based on memory addresses specific to Zelda
             return {
@@ -254,6 +300,8 @@ class PyBoyClient:
                 'in_text_box': is_in_text_box,  # Detect dialogue/text
                 'in_menu': False,  # Detect menu state
                 'in_cutscene': False,  # Detect cutscene
+                'text_detected': detected_text,  # Extracted text from screen
+                'text_history': self.text_extractor.get_text_history(),  # Recent text history
             }
         except Exception as e:
             logger.error(f"Failed to read game state: {e}")

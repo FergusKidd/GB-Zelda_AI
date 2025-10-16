@@ -70,8 +70,8 @@ class LocalController:
             reasoning = decision.get('reasoning', 'No reasoning provided')
             confidence = decision.get('confidence', 0.0)
             
-            logger.info(f"Executing sequence: {len(sequence)} actions (confidence: {confidence:.2f})")
-            logger.info(f"Reasoning: {reasoning}")
+            logger.debug(f"Executing sequence: {len(sequence)} actions (confidence: {confidence:.2f})")
+            logger.debug(f"Reasoning: {reasoning}")
             
             # Validate sequence
             if not sequence:
@@ -109,7 +109,7 @@ class LocalController:
                 logger.debug(f"Action {i+1}/{len(sequence)}: {button} for {duration_frames} frames, delay {delay_frames}")
                 
                 # Press button
-                logger.info(f"🎮 PRESSING BUTTON: {button.upper()}")
+                logger.debug(f"🎮 PRESSING BUTTON: {button.upper()}")
                 if not self.pyboy_client.press_button(button):
                     logger.error(f"Failed to press button: {button}")
                     return False
@@ -119,17 +119,17 @@ class LocalController:
                 if button in ['up', 'down', 'left', 'right']:
                     # Movement buttons: use shorter duration but more responsive
                     hold_time = min(duration_frames / 60.0, 0.3)  # Cap at 0.3 seconds
-                    logger.info(f"⏱️  Holding {button.upper()} for {hold_time:.2f} seconds (optimized for movement)")
+                    logger.debug(f"⏱️  Holding {button.upper()} for {hold_time:.2f} seconds (optimized for movement)")
                 else:
                     # Action buttons: use original duration
                     hold_time = duration_frames / 60.0
-                    logger.info(f"⏱️  Holding {button.upper()} for {hold_time:.2f} seconds")
+                    logger.debug(f"⏱️  Holding {button.upper()} for {hold_time:.2f} seconds")
                 
                 # Use shorter sleep for more responsive movement
                 time.sleep(hold_time)
                 
                 # Release button
-                logger.info(f"🎮 RELEASING BUTTON: {button.upper()}")
+                logger.debug(f"🎮 RELEASING BUTTON: {button.upper()}")
                 if not self.pyboy_client.release_button(button):
                     logger.error(f"Failed to release button: {button}")
                     return False
