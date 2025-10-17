@@ -76,11 +76,11 @@ class ZeldaAIPlayer:
         try:
             logger.debug("Initializing Zelda AI Player...")
             
-            # Initialize PyBoy client
+            # Initialize PyBoy client (will automatically try to load save state)
             logger.debug("Initializing PyBoy client...")
             window_type = os.getenv('WINDOW_TYPE', 'SDL2')
             self.pyboy_client = PyBoyClient(self.rom_path, self.game_speed, window_type)
-            if not self.pyboy_client.initialize():
+            if not self.pyboy_client.initialize(try_load_state=True):
                 logger.error("Failed to initialize PyBoy client")
                 return False
             
@@ -154,13 +154,28 @@ class ZeldaAIPlayer:
                 # Advance game frame (skip if executing input to prevent interference)
                 if not self.pyboy_client.is_executing_input:
                     if not self.pyboy_client.tick():
-                        logger.warning("Game stopped running")
+                        # Game stopped - get diagnostic info
+                        health = self.pyboy_client.check_health()
+                        logger.warning(f"Game stopped running - Health check: {health}")
+                        if not health.get('healthy', False):
+                            logger.error(f"PyBoy health issues: {health.get('errors', [])}")
                         break
                 else:
                     # Skip ticking during input execution
                     pass
                 
                 self.frame_count += 1
+                
+                # Periodic health check every 1000 frames
+                if self.frame_count % 1000 == 0:
+                    health = self.pyboy_client.check_health()
+                    if not health.get('healthy', False):
+                        logger.warning(f"PyBoy health check failed at frame {self.frame_count}: {health}")
+                
+                # Auto-save state every 500 frames (roughly every 8 seconds)
+                if self.frame_count % 500 == 0 and self.frame_count > 0:
+                    self.pyboy_client.save_state()
+                    logger.debug(f"💾 Auto-saved at frame {self.frame_count}")
                 
                 # Check for input to start AI
                 if not self.ai_started:
@@ -229,8 +244,34 @@ class ZeldaAIPlayer:
             # Get current game state
             game_state = self.pyboy_client.get_game_state()
             
-            # Get AI decision (this is the slow part - now async)
+            # Check room visit status
+            current_room = game_state.get('room_id', 0)
+            room_info = self.history_manager.check_room_visit(current_room)
+            game_state['room_info'] = room_info
+            
+            # Check if stuck
+            is_stuck = self.history_manager.check_if_stuck(game_state)
+            if is_stuck:
+                logger.warning("⚠️  Link appears to be stuck - informing AI to try different actions")
+            game_state['is_stuck'] = is_stuck
+            
+            # Check if we need to update the high-level plan
             history_context = self.history_manager.get_context_for_ai() if self.use_history_context else None
+            if self.history_manager.should_update_plan(max_cycles=5):
+                logger.info("🎯 Requesting new high-level plan from planning AI...")
+                plan = await asyncio.get_event_loop().run_in_executor(
+                    None, self.azure_client.get_high_level_plan, processed_screen, game_state, history_context
+                )
+                if plan:
+                    self.history_manager.update_plan(plan)
+                    logger.info(f"📋 New Plan: {plan['goal']}")
+                    # Refresh context with new plan
+                    history_context = self.history_manager.get_context_for_ai() if self.use_history_context else None
+            
+            # Increment plan cycle counter
+            self.history_manager.increment_plan_cycle()
+            
+            # Get AI decision (this is the slow part - now async)
             decision = await asyncio.get_event_loop().run_in_executor(
                 None, self.azure_client.get_game_decision, processed_screen, game_state, history_context
             )
@@ -264,7 +305,10 @@ class ZeldaAIPlayer:
                 self.history_manager.add_story_event('dialogue', chatgpt_text, {
                     'in_text_box': game_state.get('in_text_box', False),
                     'decision_id': self.decision_count,
-                    'source': 'chatgpt'
+                    'source': 'chatgpt',
+                    'position_x': game_state.get('position_x', 0),
+                    'position_y': game_state.get('position_y', 0),
+                    'room_id': game_state.get('room_id', 0)
                 })
             
             return success

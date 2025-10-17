@@ -12,6 +12,10 @@ from text_extractor import TextExtractor
 
 logger = logging.getLogger(__name__)
 
+# Enable PyBoy's internal logging for crash diagnostics
+pyboy_logger = logging.getLogger('pyboy')
+pyboy_logger.setLevel(logging.DEBUG)
+
 
 class PyBoyClient:
     """Client for managing PyBoy emulation and screen capture."""
@@ -33,10 +37,14 @@ class PyBoyClient:
         self.pyboy: Optional[PyBoy] = None
         self.screen_width = 160
         self.screen_height = 144
+        self.save_state_file = "logs/pyboy_save_state.state"
         
-    def initialize(self) -> bool:
+    def initialize(self, try_load_state: bool = True) -> bool:
         """
         Initialize PyBoy with the ROM.
+        
+        Args:
+            try_load_state: Whether to try loading a saved state
         
         Returns:
             True if initialization successful, False otherwise
@@ -49,15 +57,34 @@ class PyBoyClient:
             self.pyboy = PyBoy(self.rom_path, window=self.window_type)
             self.pyboy.set_emulation_speed(self.game_speed)
             
-            # Skip initial boot sequence
-            for _ in range(60):  # Wait for boot
-                self.pyboy.tick()
+            # Try to load save state first (before boot sequence)
+            state_loaded = False
+            if try_load_state and os.path.exists(self.save_state_file):
+                try:
+                    with open(self.save_state_file, "rb") as f:
+                        self.pyboy.load_state(f)
+                    logger.info(f"📂 ✅ Resumed from save state: {self.save_state_file}")
+                    state_loaded = True
+                except Exception as e:
+                    logger.warning(f"Failed to load save state, starting fresh: {e}")
+                    state_loaded = False
+            
+            # If no state loaded, skip initial boot sequence
+            if not state_loaded:
+                logger.info("🆕 Starting new game (no save state loaded)")
+                for _ in range(60):  # Wait for boot
+                    self.pyboy.tick()
                 
             logger.info(f"PyBoy initialized successfully with ROM: {self.rom_path}")
             return True
             
         except Exception as e:
             logger.error(f"Failed to initialize PyBoy: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
+            
+            # Log full stack trace for debugging
+            import traceback
+            logger.error(f"Stack trace:\n{traceback.format_exc()}")
             return False
     
     def get_screen_image(self) -> Optional[np.ndarray]:
@@ -264,14 +291,110 @@ class PyBoyClient:
             return False
             
         try:
-            return self.pyboy.tick()
+            # Check PyBoy state before ticking
+            if hasattr(self.pyboy, 'stopped') and self.pyboy.stopped:
+                logger.warning("PyBoy reports game has stopped")
+                return False
+            
+            # Advance one frame
+            result = self.pyboy.tick()
+            
+            # Check if game is still running
+            if not result:
+                logger.warning("Game stopped running - PyBoy tick returned False")
+                # Try to get more diagnostic info
+                try:
+                    if hasattr(self.pyboy, 'stopped'):
+                        logger.warning(f"PyBoy stopped flag: {self.pyboy.stopped}")
+                    if hasattr(self.pyboy, 'cartridge') and self.pyboy.cartridge:
+                        logger.warning("Cartridge still loaded")
+                    else:
+                        logger.error("Cartridge not loaded - possible ROM issue")
+                except Exception as diag_e:
+                    logger.debug(f"Could not get diagnostic info: {diag_e}")
+                return False
+            
+            return True
+            
         except Exception as e:
-            logger.error(f"Failed to tick PyBoy: {e}")
+            logger.error(f"Error during tick: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
+            
+            # Log full stack trace for debugging
+            import traceback
+            logger.error(f"Stack trace:\n{traceback.format_exc()}")
+            
+            # Try to get more info about the error
+            try:
+                if hasattr(self.pyboy, 'stopped'):
+                    logger.error(f"PyBoy stopped flag: {self.pyboy.stopped}")
+            except:
+                pass
             return False
+    
+    def check_health(self) -> dict:
+        """
+        Check PyBoy and game health status.
+        
+        Returns:
+            Dictionary with health status information
+        """
+        if not self.pyboy:
+            return {'healthy': False, 'reason': 'PyBoy not initialized'}
+        
+        try:
+            health_info = {
+                'healthy': True,
+                'pyboy_stopped': False,
+                'cartridge_loaded': False,
+                'errors': []
+            }
+            
+            # Check if PyBoy reports stopped
+            if hasattr(self.pyboy, 'stopped'):
+                health_info['pyboy_stopped'] = self.pyboy.stopped
+                if self.pyboy.stopped:
+                    health_info['healthy'] = False
+                    health_info['errors'].append('PyBoy reports stopped')
+            
+            # Check cartridge status
+            if hasattr(self.pyboy, 'cartridge'):
+                health_info['cartridge_loaded'] = self.pyboy.cartridge is not None
+                if not health_info['cartridge_loaded']:
+                    health_info['healthy'] = False
+                    health_info['errors'].append('Cartridge not loaded')
+            
+            return health_info
+            
+        except Exception as e:
+            return {
+                'healthy': False,
+                'reason': f'Health check failed: {e}',
+                'error_type': type(e).__name__
+            }
+    
+    def read_memory(self, address: int) -> int:
+        """
+        Read a byte from Game Boy memory.
+        
+        Args:
+            address: Memory address to read from (0x0000-0xFFFF)
+            
+        Returns:
+            Byte value at the address (0-255)
+        """
+        if not self.pyboy:
+            return 0
+        
+        try:
+            return self.pyboy.get_memory_value(address)
+        except Exception as e:
+            logger.debug(f"Failed to read memory at 0x{address:04X}: {e}")
+            return 0
     
     def get_game_state(self) -> dict:
         """
-        Extract basic game state information including text box detection.
+        Extract game state information including player position.
         
         Returns:
             Dictionary containing game state data
@@ -289,19 +412,41 @@ class PyBoyClient:
             if screen_image is not None:
                 detected_text = self.text_extractor.extract_text_from_screen(screen_image) or ""
             
-            # This is a placeholder - you'll need to implement actual game state reading
-            # based on memory addresses specific to Zelda
+            # Read player position from memory
+            # Common memory addresses for Link's Awakening (may need adjustment):
+            # Player X position is typically around 0xD100-0xD102
+            # Player Y position is typically around 0xD101-0xD103
+            # Room/screen ID is typically around 0xD700
+            
+            # Try common memory addresses for Link's Awakening
+            position_x = self.read_memory(0xD100)  # Player X coordinate
+            position_y = self.read_memory(0xD101)  # Player Y coordinate
+            room_id = self.read_memory(0xD700)     # Current room/screen ID
+            
+            # Read Link's facing direction (common address for Link's Awakening)
+            # Typical values: 0=down, 1=up, 2=left, 3=right
+            direction_value = self.read_memory(0xD005)  # Link's direction
+            direction_map = {0: 'down', 1: 'up', 2: 'left', 3: 'right'}
+            facing_direction = direction_map.get(direction_value, 'unknown')
+            
+            # Alternative addresses if the above don't work:
+            # position_x = self.read_memory(0xD202)
+            # position_y = self.read_memory(0xD203)
+            # direction = self.read_memory(0xD027) or 0xD006
+            
             return {
-                'health': 0,  # Read from memory
-                'rupees': 0,  # Read from memory
-                'current_screen': 0,  # Read from memory
-                'position_x': 0,  # Read from memory
-                'position_y': 0,  # Read from memory
-                'in_text_box': is_in_text_box,  # Detect dialogue/text
-                'in_menu': False,  # Detect menu state
-                'in_cutscene': False,  # Detect cutscene
-                'text_detected': detected_text,  # Extracted text from screen
-                'text_history': self.text_extractor.get_text_history(),  # Recent text history
+                'health': self.read_memory(0xDB5A),  # Player health (common address)
+                'rupees': 0,  # Read from memory (address TBD)
+                'current_screen': room_id,
+                'position_x': position_x,
+                'position_y': position_y,
+                'room_id': room_id,
+                'facing_direction': facing_direction,
+                'in_text_box': is_in_text_box,
+                'in_menu': False,
+                'in_cutscene': False,
+                'text_detected': detected_text,
+                'text_history': self.text_extractor.get_text_history(),
             }
         except Exception as e:
             logger.error(f"Failed to read game state: {e}")
@@ -342,10 +487,58 @@ class PyBoyClient:
             logger.error(f"Failed to detect text box: {e}")
             return False
     
+    def save_state(self) -> bool:
+        """
+        Save the current game state to a file.
+        
+        Returns:
+            True if save successful, False otherwise
+        """
+        if not self.pyboy:
+            logger.error("PyBoy not initialized, cannot save state")
+            return False
+        
+        try:
+            # PyBoy save state
+            with open(self.save_state_file, "wb") as f:
+                self.pyboy.save_state(f)
+            logger.info(f"💾 Game state saved to {self.save_state_file}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save game state: {e}")
+            return False
+    
+    def load_state(self) -> bool:
+        """
+        Load a previously saved game state.
+        
+        Returns:
+            True if load successful, False otherwise
+        """
+        if not self.pyboy:
+            logger.error("PyBoy not initialized, cannot load state")
+            return False
+        
+        if not os.path.exists(self.save_state_file):
+            logger.info("No save state file found")
+            return False
+        
+        try:
+            # PyBoy load state
+            with open(self.save_state_file, "rb") as f:
+                self.pyboy.load_state(f)
+            logger.info(f"📂 Game state loaded from {self.save_state_file}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load game state: {e}")
+            return False
+    
     def close(self):
         """Close PyBoy emulation."""
         if self.pyboy:
             try:
+                # Save state before closing
+                self.save_state()
                 self.pyboy.stop()
                 logger.info("PyBoy closed successfully")
             except Exception as e:
